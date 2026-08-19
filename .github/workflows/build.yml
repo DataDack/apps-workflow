@@ -63,7 +63,7 @@ jobs:
 
       - name: Start build log
         shell: bash
-        run: : > "$RUNNER_TEMP/datadack.log"
+        run: ': > "$RUNNER_TEMP/datadack.log"'
 
       - name: Install dependencies
         shell: bash
