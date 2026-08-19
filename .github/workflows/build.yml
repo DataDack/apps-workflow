@@ -1,0 +1,171 @@
+name: DataDack Managed App Build
+
+on:
+  workflow_call:
+    inputs:
+      project_id:
+        description: DataDack project identifier
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      DATADACK_API: https://console.datadack.cloud/api/v1
+      DATADACK_PROJECT_ID: ${{ inputs.project_id }}
+    steps:
+      - name: Check out application
+        uses: actions/checkout@v4
+
+      - name: Claim build
+        id: claim
+        shell: bash
+        run: |
+          set -euo pipefail
+          OIDC=$(curl -sS --fail-with-body \
+            -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=datadack-cloud" | jq -r '.value')
+          echo "::add-mask::$OIDC"
+          echo "oidc=$OIDC" >> "$GITHUB_OUTPUT"
+          jq -n \
+            --arg project_id "$DATADACK_PROJECT_ID" \
+            --arg run_id "$GITHUB_RUN_ID" \
+            --arg run_attempt "$GITHUB_RUN_ATTEMPT" \
+            --arg sha "$GITHUB_SHA" \
+            --arg ref "$GITHUB_REF" \
+            --arg run_url "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
+            '{project_id:$project_id,run_id:$run_id,run_attempt:$run_attempt,sha:$sha,ref:$ref,run_url:$run_url}' > claim-request.json
+          curl -sS --fail-with-body -X POST \
+            "$DATADACK_API/managedapps/actions/builds/claim" \
+            -H "Authorization: Bearer $OIDC" -H "Content-Type: application/json" \
+            --data-binary @claim-request.json -o claim.json
+          for key in build_id upload_url image_upload_url log_url root_dir install_command build_command output_dir node_version project_type; do
+            value=$(jq -r --arg key "$key" '.data[$key] // empty' claim.json)
+            printf '%s=%s\n' "$key" "$value" >> "$GITHUB_OUTPUT"
+          done
+          jq -r '.data.env // {} | to_entries[] | "::add-mask::" + .value' claim.json
+          jq -r '.data.env // {} | to_entries[] | .key + "=" + .value' claim.json >> "$GITHUB_ENV"
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ steps.claim.outputs.node_version }}
+
+      - name: Set up Bun
+        shell: bash
+        run: npm install --global bun@1
+
+      - name: Start build log
+        shell: bash
+        run: : > "$RUNNER_TEMP/datadack.log"
+
+      - name: Install dependencies
+        shell: bash
+        working-directory: ${{ steps.claim.outputs.root_dir }}
+        env:
+          DATADACK_COMMAND: ${{ steps.claim.outputs.install_command }}
+        run: set -o pipefail; bash -o pipefail -c "$DATADACK_COMMAND" 2>&1 | tee -a "$RUNNER_TEMP/datadack.log"
+
+      - name: Configure OpenNext
+        if: steps.claim.outputs.project_type == 'opennext'
+        shell: bash
+        working-directory: ${{ steps.claim.outputs.root_dir }}
+        run: |
+          if ! ls open-next.config.* >/dev/null 2>&1; then
+            cat > open-next.config.ts <<'EOF'
+          export default { default: { override: { wrapper: "node", converter: "node", incrementalCache: "fs-dev", tagCache: "fs-dev", queue: "direct" } } };
+          EOF
+          fi
+
+      - name: Build application
+        shell: bash
+        working-directory: ${{ steps.claim.outputs.root_dir }}
+        env:
+          DATADACK_COMMAND: ${{ steps.claim.outputs.build_command }}
+        run: set -o pipefail; bash -o pipefail -c "$DATADACK_COMMAND" 2>&1 | tee -a "$RUNNER_TEMP/datadack.log"
+
+      - name: Package output and runtime image
+        shell: bash
+        env:
+          ROOT_DIR: ${{ steps.claim.outputs.root_dir }}
+          OUTPUT_DIR: ${{ steps.claim.outputs.output_dir }}
+          PROJECT_TYPE: ${{ steps.claim.outputs.project_type }}
+          NODE_VERSION: ${{ steps.claim.outputs.node_version }}
+        run: |
+          set -euo pipefail
+          output="$ROOT_DIR/$OUTPUT_DIR"
+          (cd "$output" && zip -qr "$RUNNER_TEMP/dist.zip" .)
+          mkdir -p "$RUNNER_TEMP/imgctx/app"
+          cp -a "$output/." "$RUNNER_TEMP/imgctx/app/"
+          if [ "$PROJECT_TYPE" = opennext ]; then
+            cat > "$RUNNER_TEMP/imgctx/Dockerfile" <<EOF
+          FROM node:${NODE_VERSION}-alpine
+          WORKDIR /app
+          COPY app ./
+          ENV NODE_ENV=production PORT=80 HOSTNAME=0.0.0.0
+          EXPOSE 80
+          ENTRYPOINT ["node", "server-functions/default/index.mjs"]
+          EOF
+          else
+            cat > "$RUNNER_TEMP/imgctx/Dockerfile" <<'EOF'
+          FROM caddy:2-alpine
+          COPY app /srv
+          RUN printf ':80 {\n\troot * /srv\n\ttry_files {path} /index.html\n\tfile_server\n}\n' > /etc/caddy/Caddyfile
+          EXPOSE 80
+          ENTRYPOINT ["caddy", "run", "--config", "/etc/caddy/Caddyfile", "--adapter", "caddyfile"]
+          EOF
+          fi
+          docker buildx create --name datadack --driver docker-container --use >/dev/null 2>&1 || docker buildx use datadack
+          docker buildx build --platform linux/amd64 --output type=oci,dest="$RUNNER_TEMP/image.tar",name=datadack-app:"$GITHUB_SHA" "$RUNNER_TEMP/imgctx"
+
+      - name: Smoke-test runtime image
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker buildx build --platform linux/amd64 --load -t datadack-smoke:local "$RUNNER_TEMP/imgctx" >/dev/null
+          docker run -d --name datadack-smoke -p 18080:80 datadack-smoke:local >/dev/null
+          trap 'docker rm -f datadack-smoke >/dev/null 2>&1 || true' EXIT
+          for _ in $(seq 1 45); do
+            code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 http://127.0.0.1:18080/ 2>/dev/null) || true
+            case "$code" in [1-4][0-9][0-9]) exit 0;; esac
+            sleep 2
+          done
+          docker logs datadack-smoke 2>&1 | tail -40
+          exit 1
+
+      - name: Upload artifacts
+        shell: bash
+        run: |
+          curl -sS --fail-with-body -X PUT --upload-file "$RUNNER_TEMP/dist.zip" -H "Content-Type: application/zip" "${{ steps.claim.outputs.upload_url }}"
+          curl -sS --fail-with-body -X PUT --upload-file "$RUNNER_TEMP/image.tar" -H "Content-Type: application/x-tar" "${{ steps.claim.outputs.image_upload_url }}"
+
+      - name: Upload build log
+        if: always() && steps.claim.outputs.build_id != ''
+        shell: bash
+        run: |
+          [ -s "$RUNNER_TEMP/datadack.log" ] || exit 0
+          tail -c 65536 "$RUNNER_TEMP/datadack.log" | jq -Rs '{chunk:.}' > "$RUNNER_TEMP/log.json"
+          curl -sS -X POST "${{ steps.claim.outputs.log_url }}" -H "Authorization: Bearer ${{ steps.claim.outputs.oidc }}" -H "Content-Type: application/json" --data-binary @"$RUNNER_TEMP/log.json" >/dev/null || true
+
+      - name: Report result
+        if: always() && steps.claim.outputs.build_id != ''
+        shell: bash
+        run: |
+          status=failed; sha256=""; bytes=0; image_sha256=""; image_bytes=0
+          if [ "${{ job.status }}" = success ]; then
+            status=built
+            sha256=$(sha256sum "$RUNNER_TEMP/dist.zip" | cut -d' ' -f1); bytes=$(wc -c < "$RUNNER_TEMP/dist.zip")
+            image_sha256=$(sha256sum "$RUNNER_TEMP/image.tar" | cut -d' ' -f1); image_bytes=$(wc -c < "$RUNNER_TEMP/image.tar")
+          fi
+          jq -n --arg status "$status" --arg sha256 "$sha256" --arg image_sha256 "$image_sha256" --arg job_status "${{ job.status }}" \
+            --argjson bytes "$bytes" --argjson image_bytes "$image_bytes" \
+            '{status:$status,sha256:$sha256,bytes:$bytes,image_sha256:$image_sha256,image_bytes:$image_bytes,job_status:$job_status}' > complete.json
+          curl -sS --fail-with-body --retry 6 --retry-all-errors --retry-delay 5 --max-time 30 -X POST \
+            "$DATADACK_API/managedapps/actions/builds/${{ steps.claim.outputs.build_id }}/complete" \
+            -H "Authorization: Bearer ${{ steps.claim.outputs.oidc }}" -H "Content-Type: application/json" --data-binary @complete.json
