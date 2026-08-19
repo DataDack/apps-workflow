@@ -63,7 +63,25 @@ jobs:
 
       - name: Start build log
         shell: bash
-        run: ': > "$RUNNER_TEMP/datadack.log"'
+        run: |
+          : > "$RUNNER_TEMP/datadack.log"
+          (
+            offset=0
+            while true; do
+              size=$(wc -c < "$RUNNER_TEMP/datadack.log" 2>/dev/null || echo 0)
+              if [ "$size" -gt "$offset" ]; then
+                tail -c "+$((offset + 1))" "$RUNNER_TEMP/datadack.log" | jq -Rs '{chunk:.}' > "$RUNNER_TEMP/datadack.chunk.json"
+                if curl -sS --fail-with-body -X POST "${{ steps.claim.outputs.log_url }}" \
+                  -H "Authorization: Bearer ${{ steps.claim.outputs.oidc }}" \
+                  -H "Content-Type: application/json" --data-binary @"$RUNNER_TEMP/datadack.chunk.json" >/dev/null; then
+                  offset=$size
+                fi
+              fi
+              [ -f "$RUNNER_TEMP/datadack.done" ] && break
+              sleep 3
+            done
+          ) &
+          echo "$!" > "$RUNNER_TEMP/datadack.streamer"
 
       - name: Install dependencies
         shell: bash
@@ -89,6 +107,20 @@ jobs:
         env:
           DATADACK_COMMAND: ${{ steps.claim.outputs.build_command }}
         run: set -o pipefail; bash -o pipefail -c "$DATADACK_COMMAND" 2>&1 | tee -a "$RUNNER_TEMP/datadack.log"
+
+      - name: Verify OpenNext produced a server
+        if: steps.claim.outputs.project_type == 'opennext'
+        shell: bash
+        working-directory: ${{ steps.claim.outputs.root_dir }}
+        run: |
+          set -euo pipefail
+          output=.open-next/open-next.output.json
+          [ -f "$output" ] || { echo "::error::$output is missing"; exit 1; }
+          wrapper=$(node -p "JSON.parse(require('fs').readFileSync('$output','utf8')).origins.default.wrapper" 2>/dev/null || true)
+          case "$wrapper" in
+            node|node-streaming) ;;
+            *) echo "::error::OpenNext produced wrapper '$wrapper', not a self-hosted server"; exit 1 ;;
+          esac
 
       - name: Package output and runtime image
         shell: bash
@@ -149,6 +181,9 @@ jobs:
         if: always() && steps.claim.outputs.build_id != ''
         shell: bash
         run: |
+
+          touch "$RUNNER_TEMP/datadack.done"
+          sleep 4
           [ -s "$RUNNER_TEMP/datadack.log" ] || exit 0
           tail -c 65536 "$RUNNER_TEMP/datadack.log" | jq -Rs '{chunk:.}' > "$RUNNER_TEMP/log.json"
           curl -sS -X POST "${{ steps.claim.outputs.log_url }}" -H "Authorization: Bearer ${{ steps.claim.outputs.oidc }}" -H "Content-Type: application/json" --data-binary @"$RUNNER_TEMP/log.json" >/dev/null || true
