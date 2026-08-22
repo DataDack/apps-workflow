@@ -45,7 +45,7 @@ jobs:
             "$DATADACK_API/managedapps/actions/builds/claim" \
             -H "Authorization: Bearer $OIDC" -H "Content-Type: application/json" \
             --data-binary @claim-request.json -o claim.json
-          for key in build_id upload_url image_upload_url log_url root_dir install_command build_command output_dir node_version project_type; do
+          for key in build_id upload_url image_upload_url workload_upload_url runtime_target log_url root_dir install_command build_command output_dir node_version project_type; do
             value=$(jq -r --arg key "$key" '.data[$key] // empty' claim.json)
             printf '%s=%s\n' "$key" "$value" >> "$GITHUB_OUTPUT"
           done
@@ -90,12 +90,31 @@ jobs:
           DATADACK_COMMAND: ${{ steps.claim.outputs.install_command }}
         run: set -o pipefail; bash -o pipefail -c "$DATADACK_COMMAND" 2>&1 | tee -a "$RUNNER_TEMP/datadack.log"
 
+      # The OpenNext wrapper depends on WHERE the app will run, and the two are
+      # not interchangeable. A container runs a long-lived HTTP server, so it
+      # wants the node wrapper. A serverless workload is invoked with an API
+      # Gateway v2 event and must export a handler, so it wants the aws-lambda
+      # wrapper and the matching converter.
+      #
+      # Building the wrong one produces an app that deploys cleanly and then
+      # fails every request: a node-wrapped bundle exports no handler for the
+      # worker to call, and a lambda-wrapped one never listens on a port.
       - name: Configure OpenNext
         if: steps.claim.outputs.project_type == 'opennext'
         shell: bash
         working-directory: ${{ steps.claim.outputs.root_dir }}
+        env:
+          RUNTIME_TARGET: ${{ steps.claim.outputs.runtime_target }}
         run: |
-          if ! ls open-next.config.* >/dev/null 2>&1; then
+          if ls open-next.config.* >/dev/null 2>&1; then
+            echo "the repository carries its own OpenNext config; leaving it alone"
+            exit 0
+          fi
+          if [ "$RUNTIME_TARGET" = serverless ]; then
+            cat > open-next.config.ts <<'EOF'
+          export default { default: { override: { wrapper: "aws-lambda", converter: "aws-apigw-v2", incrementalCache: "fs-dev", tagCache: "fs-dev", queue: "direct" } } };
+          EOF
+          else
             cat > open-next.config.ts <<'EOF'
           export default { default: { override: { wrapper: "node", converter: "node", incrementalCache: "fs-dev", tagCache: "fs-dev", queue: "direct" } } };
           EOF
@@ -112,17 +131,30 @@ jobs:
         if: steps.claim.outputs.project_type == 'opennext'
         shell: bash
         working-directory: ${{ steps.claim.outputs.root_dir }}
+        env:
+          RUNTIME_TARGET: ${{ steps.claim.outputs.runtime_target }}
         run: |
           set -euo pipefail
           output=.open-next/open-next.output.json
           [ -f "$output" ] || { echo "::error::$output is missing"; exit 1; }
           wrapper=$(node -p "JSON.parse(require('fs').readFileSync('$output','utf8')).origins.default.wrapper" 2>/dev/null || true)
-          case "$wrapper" in
-            node|node-streaming) ;;
-            *) echo "::error::OpenNext produced wrapper '$wrapper', not a self-hosted server"; exit 1 ;;
-          esac
+          if [ "$RUNTIME_TARGET" = serverless ]; then
+            case "$wrapper" in
+              aws-lambda|aws-lambda-streaming) ;;
+              *) echo "::error::OpenNext produced wrapper '$wrapper', not a Lambda handler — this project targets the serverless runtime"; exit 1 ;;
+            esac
+          else
+            case "$wrapper" in
+              node|node-streaming) ;;
+              *) echo "::error::OpenNext produced wrapper '$wrapper', not a self-hosted server"; exit 1 ;;
+            esac
+          fi
 
       - name: Package output and runtime image
+        # The container image is the slowest step in this job by a wide margin,
+        # and a serverless project never uses it. Skipping it there is most of
+        # the build-time difference between the two runtimes.
+        if: steps.claim.outputs.runtime_target != 'serverless'
         shell: bash
         env:
           ROOT_DIR: ${{ steps.claim.outputs.root_dir }}
@@ -156,7 +188,133 @@ jobs:
           docker buildx create --name datadack --driver docker-container --use >/dev/null 2>&1 || docker buildx use datadack
           docker buildx build --platform linux/amd64 --output type=oci,dest="$RUNNER_TEMP/image.tar",name=datadack-app:"$GITHUB_SHA" "$RUNNER_TEMP/imgctx"
 
+      # The serverless deployment bundle: the server function's own directory,
+      # zipped from INSIDE it so the handler sits at the archive root. The
+      # control plane deploys it with handler "index.handler", which only
+      # resolves if the entry point is not nested — so the `cd` here is load
+      # bearing, not a tidiness choice.
+      #
+      # This uploads to a presigned PUT in the SERVERLESS control plane's
+      # bucket, not this platform's: a worker fetches packages only from that
+      # one, so a bundle uploaded anywhere else deploys a workload whose code
+      # cannot be read.
+      # The platform's own runtime files, checked out beside the customer's app.
+      # The asset wrapper lives here as a real, reviewable .mjs file rather than
+      # a heredoc in this workflow, because it is a hundred lines of security
+      # relevant path handling and that does not belong inside YAML.
+      - name: Check out platform runtime
+        if: steps.claim.outputs.runtime_target == 'serverless'
+        uses: actions/checkout@v4
+        with:
+          repository: DataDack/apps-workflow
+          ref: main
+          path: .datadack-runtime
+          persist-credentials: false
+
+      - name: Package and upload serverless bundle
+        if: steps.claim.outputs.runtime_target == 'serverless'
+        id: workload
+        shell: bash
+        env:
+          ROOT_DIR: ${{ steps.claim.outputs.root_dir }}
+          OUTPUT_DIR: ${{ steps.claim.outputs.output_dir }}
+          PROJECT_TYPE: ${{ steps.claim.outputs.project_type }}
+          UPLOAD_URL: ${{ steps.claim.outputs.workload_upload_url }}
+        run: |
+          set -euo pipefail
+          if [ -z "$UPLOAD_URL" ]; then
+            echo "::error::this project targets the serverless runtime but the platform issued no upload slot for it"
+            exit 1
+          fi
+          out="$ROOT_DIR/$OUTPUT_DIR"
+          staging="$RUNNER_TEMP/workload"
+          rm -rf "$staging"; mkdir -p "$staging/assets"
+
+          # Two shapes of bundle, decided by whether the build produced a server.
+          #
+          # opennext: OpenNext's server bundle at the archive root, plus the
+          # assets it does not serve. The wrapper delegates page requests to it.
+          #
+          # react: no server at all — the build output IS the site. The same
+          # wrapper serves it with try-files behaviour, which is what the Caddy
+          # container did. Nothing else about the packaging differs, which is
+          # why one wrapper covers both.
+          if [ "$PROJECT_TYPE" = opennext ]; then
+            bundle="$out/server-functions/default"
+            [ -d "$bundle" ] || { echo "::error::$bundle is missing — OpenNext produced no server function"; exit 1; }
+            [ -f "$bundle/index.mjs" ] || {
+              echo "::error::$bundle has no index.mjs for the wrapper to delegate to"; exit 1; }
+            cp -a "$bundle/." "$staging/"
+
+            # Assets ship INSIDE the bundle because there is no CDN in front of a
+            # workload. On AWS these sit in S3 behind CloudFront and the server
+            # function never sees a request for one; self-hosted, every
+            # /_next/static request arrives at the handler, and without these the
+            # app renders unstyled with no client bundle.
+            if [ -d "$out/assets" ]; then
+              cp -a "$out/assets/." "$staging/assets/"
+            else
+              echo "::warning::$out/assets is missing — static files will 404 at runtime"
+            fi
+          else
+            [ -d "$out" ] || { echo "::error::$out is missing — the build produced no output directory"; exit 1; }
+            cp -a "$out/." "$staging/assets/"
+            # index.html is not optional here: it is what every unmatched path
+            # falls back to, so without it a single-page app answers 404 on every
+            # route but the ones that happen to be files.
+            [ -f "$staging/assets/index.html" ] || {
+              echo "::error::$out has no index.html — a static site needs one to serve its routes"; exit 1; }
+            # The wrapper infers static mode from the ABSENCE of index.mjs. A
+            # build output that happens to contain one at its root would be
+            # mistaken for a server bundle, so refuse rather than mis-serve.
+            [ -f "$staging/index.mjs" ] && {
+              echo "::error::the build output contains index.mjs at its root, which collides with the server-bundle marker"; exit 1; }
+          fi
+
+          cp "$GITHUB_WORKSPACE/.datadack-runtime/runtime/datadack-handler.mjs" "$staging/datadack-handler.mjs"
+
+          # 250 MB unpacked is the platform ceiling. Failing here names the real
+          # problem; letting it through fails the deploy with a size error the
+          # customer cannot act on.
+          unpacked=$(du -sb "$staging" | cut -f1)
+          if [ "$unpacked" -gt 262144000 ]; then
+            echo "::error::the deployment bundle is $((unpacked / 1048576)) MB unpacked, over the 250 MB limit"
+            exit 1
+          fi
+
+          # Invoke the assembled bundle before uploading it.
+          #
+          # This is the only step that proves the three things a deploy silently
+          # depends on: that the handler resolves at the path the control plane
+          # will name, that the wrapper can reach the server (or fall back), and
+          # that assets are actually in the archive. Each of those fails at
+          # RUNTIME otherwise — as a blank page or an unstyled one — long after
+          # the build was reported green.
+          node --input-type=module -e '
+            import { handler } from "'"$staging"'/datadack-handler.mjs";
+            const get = (p) => handler({ rawPath: p, requestContext: { http: { method: "GET", path: p } } });
+            const root = await get("/");
+            const status = root && root.statusCode;
+            // 4xx counts as a failure, not just 5xx. An empty bundle — no
+            // server, no assets — answers 404 for everything, and a check that
+            // accepted it would pass the one build most worth stopping.
+            if (!status || status >= 400) {
+              console.error("::error::the bundle answered " + status + " for / — it has no server, no index.html, or a root route that does not resolve");
+              process.exit(1);
+            }
+            console.log("bundle smoke: / -> " + status);
+          ' || exit 1
+
+          (cd "$staging" && zip -qr "$RUNNER_TEMP/workload.zip" .)
+          curl -sS --fail-with-body -X PUT --upload-file "$RUNNER_TEMP/workload.zip" \
+            -H "Content-Type: application/zip" "$UPLOAD_URL"
+          {
+            echo "sha256=$(sha256sum "$RUNNER_TEMP/workload.zip" | cut -d" " -f1)"
+            echo "bytes=$(wc -c < "$RUNNER_TEMP/workload.zip")"
+          } >> "$GITHUB_OUTPUT"
+
       - name: Smoke-test runtime image
+        if: steps.claim.outputs.runtime_target != 'serverless'
         shell: bash
         run: |
           set -euo pipefail
@@ -174,8 +332,13 @@ jobs:
       - name: Upload artifacts
         shell: bash
         run: |
+          set -euo pipefail
           curl -sS --fail-with-body -X PUT --upload-file "$RUNNER_TEMP/dist.zip" -H "Content-Type: application/zip" "${{ steps.claim.outputs.upload_url }}"
-          curl -sS --fail-with-body -X PUT --upload-file "$RUNNER_TEMP/image.tar" -H "Content-Type: application/x-tar" "${{ steps.claim.outputs.image_upload_url }}"
+          # The OCI archive exists only on the container path; the serverless
+          # bundle was already uploaded by its own step, to a different bucket.
+          if [ -f "$RUNNER_TEMP/image.tar" ]; then
+            curl -sS --fail-with-body -X PUT --upload-file "$RUNNER_TEMP/image.tar" -H "Content-Type: application/x-tar" "${{ steps.claim.outputs.image_upload_url }}"
+          fi
 
       - name: Upload build log
         if: always() && steps.claim.outputs.build_id != ''
@@ -193,14 +356,20 @@ jobs:
         shell: bash
         run: |
           status=failed; sha256=""; bytes=0; image_sha256=""; image_bytes=0
+          workload_sha256="${{ steps.workload.outputs.sha256 }}"; workload_bytes="${{ steps.workload.outputs.bytes }}"
+          : "${workload_bytes:=0}"
           if [ "${{ job.status }}" = success ]; then
             status=built
             sha256=$(sha256sum "$RUNNER_TEMP/dist.zip" | cut -d' ' -f1); bytes=$(wc -c < "$RUNNER_TEMP/dist.zip")
-            image_sha256=$(sha256sum "$RUNNER_TEMP/image.tar" | cut -d' ' -f1); image_bytes=$(wc -c < "$RUNNER_TEMP/image.tar")
+            # Absent on the serverless path, where no image is built at all.
+            if [ -f "$RUNNER_TEMP/image.tar" ]; then
+              image_sha256=$(sha256sum "$RUNNER_TEMP/image.tar" | cut -d' ' -f1); image_bytes=$(wc -c < "$RUNNER_TEMP/image.tar")
+            fi
           fi
           jq -n --arg status "$status" --arg sha256 "$sha256" --arg image_sha256 "$image_sha256" --arg job_status "${{ job.status }}" \
-            --argjson bytes "$bytes" --argjson image_bytes "$image_bytes" \
-            '{status:$status,sha256:$sha256,bytes:$bytes,image_sha256:$image_sha256,image_bytes:$image_bytes,job_status:$job_status}' > complete.json
+            --arg workload_sha256 "$workload_sha256" \
+            --argjson bytes "$bytes" --argjson image_bytes "$image_bytes" --argjson workload_bytes "$workload_bytes" \
+            '{status:$status,sha256:$sha256,bytes:$bytes,image_sha256:$image_sha256,image_bytes:$image_bytes,workload_sha256:$workload_sha256,workload_bytes:$workload_bytes,job_status:$job_status}' > complete.json
           curl -sS --fail-with-body --retry 6 --retry-all-errors --retry-delay 5 --max-time 30 -X POST \
             "$DATADACK_API/managedapps/actions/builds/${{ steps.claim.outputs.build_id }}/complete" \
             -H "Authorization: Bearer ${{ steps.claim.outputs.oidc }}" -H "Content-Type: application/json" --data-binary @complete.json
