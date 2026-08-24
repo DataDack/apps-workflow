@@ -75,6 +75,12 @@ jobs:
                   -H "Authorization: Bearer ${{ steps.claim.outputs.oidc }}" \
                   -H "Content-Type: application/json" --data-binary @"$RUNNER_TEMP/datadack.chunk.json" >/dev/null; then
                   offset=$size
+                  # Published so the final flush knows where the stream got to.
+                  # The offset lives in this subshell otherwise, and the flush
+                  # step ran `tail -c 65536` over the WHOLE file instead — which
+                  # re-sent everything the streamer had already delivered and is
+                  # why a build's log rendered twice in the console.
+                  echo "$offset" > "$RUNNER_TEMP/datadack.offset"
                 fi
               fi
               [ -f "$RUNNER_TEMP/datadack.done" ] && break
@@ -329,16 +335,18 @@ jobs:
           docker logs datadack-smoke 2>&1 | tail -40
           exit 1
 
-      - name: Upload artifacts
+      # Container artifacts only. Both files are produced by "Package output and
+      # runtime image", which does not run on the serverless path — so neither
+      # does this. Leaving it ungated is what failed every serverless build:
+      # curl exited 26 on a dist.zip that was never written, AFTER the workload
+      # bundle had already uploaded and smoke-tested clean.
+      - name: Upload container artifacts
+        if: steps.claim.outputs.runtime_target != 'serverless'
         shell: bash
         run: |
           set -euo pipefail
           curl -sS --fail-with-body -X PUT --upload-file "$RUNNER_TEMP/dist.zip" -H "Content-Type: application/zip" "${{ steps.claim.outputs.upload_url }}"
-          # The OCI archive exists only on the container path; the serverless
-          # bundle was already uploaded by its own step, to a different bucket.
-          if [ -f "$RUNNER_TEMP/image.tar" ]; then
-            curl -sS --fail-with-body -X PUT --upload-file "$RUNNER_TEMP/image.tar" -H "Content-Type: application/x-tar" "${{ steps.claim.outputs.image_upload_url }}"
-          fi
+          curl -sS --fail-with-body -X PUT --upload-file "$RUNNER_TEMP/image.tar" -H "Content-Type: application/x-tar" "${{ steps.claim.outputs.image_upload_url }}"
 
       - name: Upload build log
         if: always() && steps.claim.outputs.build_id != ''
@@ -348,7 +356,15 @@ jobs:
           touch "$RUNNER_TEMP/datadack.done"
           sleep 4
           [ -s "$RUNNER_TEMP/datadack.log" ] || exit 0
-          tail -c 65536 "$RUNNER_TEMP/datadack.log" | jq -Rs '{chunk:.}' > "$RUNNER_TEMP/log.json"
+          # Only the tail the streamer never got to send. It exits on its own
+          # after one last pass, so this is usually empty; it stops being empty
+          # exactly when the streamer died early, which is the case this step
+          # exists for.
+          offset=$(cat "$RUNNER_TEMP/datadack.offset" 2>/dev/null || echo 0)
+          size=$(wc -c < "$RUNNER_TEMP/datadack.log")
+          [ "$size" -gt "$offset" ] || exit 0
+          tail -c "+$((offset + 1))" "$RUNNER_TEMP/datadack.log" | tail -c 65536 |
+            jq -Rs '{chunk:.}' > "$RUNNER_TEMP/log.json"
           curl -sS -X POST "${{ steps.claim.outputs.log_url }}" -H "Authorization: Bearer ${{ steps.claim.outputs.oidc }}" -H "Content-Type: application/json" --data-binary @"$RUNNER_TEMP/log.json" >/dev/null || true
 
       - name: Report result
@@ -360,8 +376,15 @@ jobs:
           : "${workload_bytes:=0}"
           if [ "${{ job.status }}" = success ]; then
             status=built
-            sha256=$(sha256sum "$RUNNER_TEMP/dist.zip" | cut -d' ' -f1); bytes=$(wc -c < "$RUNNER_TEMP/dist.zip")
-            # Absent on the serverless path, where no image is built at all.
+            # Both are absent on the serverless path, where the build produces a
+            # workload bundle and nothing else. Statting them unconditionally
+            # failed this step under `set -e`, which is worse than the upload
+            # failure it followed: the step is `if: always()`, so its death left
+            # the build with no report at all and the row stuck at `building`
+            # until the sweeper timed it out.
+            if [ -f "$RUNNER_TEMP/dist.zip" ]; then
+              sha256=$(sha256sum "$RUNNER_TEMP/dist.zip" | cut -d' ' -f1); bytes=$(wc -c < "$RUNNER_TEMP/dist.zip")
+            fi
             if [ -f "$RUNNER_TEMP/image.tar" ]; then
               image_sha256=$(sha256sum "$RUNNER_TEMP/image.tar" | cut -d' ' -f1); image_bytes=$(wc -c < "$RUNNER_TEMP/image.tar")
             fi
