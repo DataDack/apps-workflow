@@ -116,13 +116,30 @@ jobs:
             echo "the repository carries its own OpenNext config; leaving it alone"
             exit 0
           fi
+          # tagCache is "dummy", never "fs-dev". Despite the name, fs-dev is a
+          # DEV-ONLY override: its module body does an unconditional top-level
+          # readFileSync of "../../dynamodb-provider/dynamodb-cache.json", a
+          # path relative to the PROCESS CWD, and OpenNext only emits that file
+          # when the build produced tagged .meta files. Neither holds for a
+          # deployed app, so selecting it crashes createMainHandler on the first
+          # request and every route answers 500.
+          #
+          # It has to be decided HERE, at build time: esbuild bakes the chosen
+          # override into index.mjs, so the deployed config cannot change it and
+          # `dangerous.disableTagCache` does not help either — the override is
+          # imported during init, before anything consults the flag.
+          #
+          # "dummy" is the supported no-op: the same original-mode interface,
+          # answering empty, touching no filesystem. The cost is that
+          # revalidateTag/revalidatePath stop invalidating, which is what
+          # fs-dev's build-time snapshot did in practice anyway.
           if [ "$RUNTIME_TARGET" = serverless ]; then
             cat > open-next.config.ts <<'EOF'
-          export default { default: { override: { wrapper: "aws-lambda", converter: "aws-apigw-v2", incrementalCache: "fs-dev", tagCache: "fs-dev", queue: "direct" } } };
+          export default { default: { override: { wrapper: "aws-lambda", converter: "aws-apigw-v2", incrementalCache: "fs-dev", tagCache: "dummy", queue: "direct" } } };
           EOF
           else
             cat > open-next.config.ts <<'EOF'
-          export default { default: { override: { wrapper: "node", converter: "node", incrementalCache: "fs-dev", tagCache: "fs-dev", queue: "direct" } } };
+          export default { default: { override: { wrapper: "node", converter: "node", incrementalCache: "fs-dev", tagCache: "dummy", queue: "direct" } } };
           EOF
           fi
 
@@ -296,19 +313,37 @@ jobs:
           # that assets are actually in the archive. Each of those fails at
           # RUNTIME otherwise — as a blank page or an unstyled one — long after
           # the build was reported green.
+          # A check that only inspects the value of a promise is not a check.
+          # The failure worth catching here does not reject: OpenNext logs an
+          # init error and leaves the handler's promise PENDING forever, so a
+          # bare `await` lets node drain the event loop and exit 0 with the
+          # status never read — which is exactly how a bundle that answers 500
+          # to every request once shipped as a green build. The deadline is what
+          # turns "never answered" into a failure; the traps catch the two ways
+          # a bundle can die out from under the await.
           node --input-type=module -e '
-            import { handler } from "'"$staging"'/datadack-handler.mjs";
+            const die = (why) => { console.error("::error::" + why); process.exit(1); };
+            process.on("unhandledRejection", (e) => die("the bundle rejected while answering / — " + ((e && e.stack) || e)));
+            process.on("uncaughtException", (e) => die("the bundle threw while answering / — " + ((e && e.stack) || e)));
+
+            const { handler } = await import("'"$staging"'/datadack-handler.mjs");
             const get = (p) => handler({ rawPath: p, requestContext: { http: { method: "GET", path: p } } });
-            const root = await get("/");
+            // NOT unref()ed: an unreferenced timer would let node exit on the
+            // very hang this is here to detect.
+            const deadline = new Promise((_, reject) => setTimeout(
+              () => reject(new Error("the bundle never answered / within 60s — its handler or one of its imports is hanging")), 60000));
+            const root = await Promise.race([get("/"), deadline]).catch((e) => die(e.message));
             const status = root && root.statusCode;
             // 4xx counts as a failure, not just 5xx. An empty bundle — no
             // server, no assets — answers 404 for everything, and a check that
             // accepted it would pass the one build most worth stopping.
             if (!status || status >= 400) {
-              console.error("::error::the bundle answered " + status + " for / — it has no server, no index.html, or a root route that does not resolve");
-              process.exit(1);
+              die("the bundle answered " + status + " for / — it has no server, no index.html, or a root route that does not resolve");
             }
             console.log("bundle smoke: / -> " + status);
+            // Explicit: the app may hold timers or sockets open, and this step
+            // has its answer already.
+            process.exit(0);
           ' || exit 1
 
           (cd "$staging" && zip -qr "$RUNNER_TEMP/workload.zip" .)
