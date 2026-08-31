@@ -229,7 +229,7 @@ jobs:
         if: steps.claim.outputs.runtime_target == 'serverless'
         uses: actions/checkout@v4
         with:
-          repository: DataDack/apps-workflow
+          repository: DataDack/workflows
           ref: main
           path: .datadack-runtime
           persist-credentials: false
