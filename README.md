@@ -1,4 +1,4 @@
-# DataDack managed-app deployments
+# DataDack workflows
 
 This repository owns the reusable GitHub Actions workflow used to build DataDack managed applications. Customer repositories contain only a stable caller; build behavior can therefore be updated here without modifying customer source.
 

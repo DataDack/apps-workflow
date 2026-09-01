@@ -1,0 +1,79 @@
+name: Set up build toolchain
+description: >
+  Install the language runtime a build needs and restore its dependency cache.
+  One place, so adding a toolchain is a change here rather than in the workflow.
+
+inputs:
+  toolchain:
+    description: node (the only one this runner supports today)
+    required: false
+    default: node
+  node_version:
+    description: The major the project builds against.
+    required: true
+  bun_version:
+    description: >
+      Pinned exactly, never a floating major. A build input that can move on its
+      own changes a customer's build with no change to their repository — and
+      when it breaks, they cannot diagnose it. This platform has already lost a
+      build to exactly that, when a floating Bun major stopped being able to
+      extract a large package.
+    required: false
+    default: "1.3.14"
+
+runs:
+  using: composite
+  steps:
+    - name: Reject an unsupported toolchain
+      shell: bash
+      env:
+        TOOLCHAIN: ${{ inputs.toolchain }}
+      run: |
+        set -euo pipefail
+        # Named rather than assumed. When Python and Go land for the dynamic
+        # frameworks, they are added here and nothing in the workflow changes.
+        case "$TOOLCHAIN" in
+          node|"") ;;
+          *)
+            echo "::error::toolchain '$TOOLCHAIN' is not supported by this runner yet — supported: node"
+            exit 1 ;;
+        esac
+
+    - name: Set up Node
+      uses: actions/setup-node@v4
+      with:
+        node-version: ${{ inputs.node_version }}
+
+    - name: Set up Bun
+      shell: bash
+      env:
+        BUN_VERSION: ${{ inputs.bun_version }}
+      run: npm install --global "bun@${BUN_VERSION}"
+
+    # Every build re-downloaded its whole dependency tree before this:
+    # setup-node was used without its `cache:` input, so nothing survived
+    # between runs. For a typical React or Next.js app that is the largest
+    # single slice of build time.
+    #
+    # The package manager is the customer's choice and their install command is
+    # arbitrary, so rather than guess one, every common cache directory is kept
+    # and the key is the hash of whichever lockfiles the repository actually
+    # has. A repository with no lockfile misses every time, which is correct —
+    # there is nothing stable to key on.
+    - name: Restore dependency cache
+      uses: actions/cache@v4
+      with:
+        path: |
+          ~/.npm
+          ~/.cache/yarn
+          ~/.local/share/pnpm/store
+          ~/.bun/install/cache
+        key: >-
+          datadack-deps-${{ runner.os }}-node${{ inputs.node_version }}-${{
+          hashFiles('**/package-lock.json', '**/yarn.lock', '**/pnpm-lock.yaml', '**/bun.lock', '**/bun.lockb') }}
+        # A partial match beats a cold download: the tree is mostly the same
+        # between two commits, so an older entry warms most of it and the
+        # install fetches only what moved.
+        restore-keys: |
+          datadack-deps-${{ runner.os }}-node${{ inputs.node_version }}-
+          datadack-deps-${{ runner.os }}-

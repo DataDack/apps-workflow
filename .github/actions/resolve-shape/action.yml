@@ -1,0 +1,97 @@
+name: Resolve build shape
+description: >
+  Turn the control plane's framework catalogue answer into the one value the
+  rest of the build branches on, and refuse a shape this runner cannot produce.
+
+inputs:
+  framework_class:
+    description: The catalogue's class — static, hybrid or dynamic. Empty on an older control plane.
+    required: false
+    default: ""
+  project_type:
+    description: The legacy three-value type. The fallback when no class is sent.
+    required: true
+  framework:
+    description: The catalogue id, for messages. Empty is fine.
+    required: false
+    default: ""
+  toolchain:
+    description: >
+      The language runtime the catalogue says this framework builds with —
+      node, go, ruby, python, or empty for a repository that is already a site.
+      Empty from an older control plane, which is treated as node.
+    required: false
+    default: ""
+
+outputs:
+  class:
+    description: static | hybrid
+    value: ${{ steps.shape.outputs.class }}
+  toolchain:
+    description: The toolchain the build needs, passed through from the catalogue.
+    value: ${{ steps.shape.outputs.toolchain }}
+
+runs:
+  using: composite
+  steps:
+    - id: shape
+      shell: bash
+      env:
+        CLASS: ${{ inputs.framework_class }}
+        PROJECT_TYPE: ${{ inputs.project_type }}
+        FRAMEWORK: ${{ inputs.framework }}
+        TOOLCHAIN: ${{ inputs.toolchain }}
+      run: |
+        set -euo pipefail
+
+        # `framework_class` is what the catalogue says: static (the output tree
+        # IS the site), hybrid (a tree AND a request handler), or dynamic (a
+        # server with nothing servable). Branching on it rather than on
+        # project_type is what lets a framework be added by editing a JSON file
+        # in a bucket, without a change to this repository — which customers do
+        # not control and cannot upgrade on their own schedule.
+        class="$CLASS"
+        if [ -z "$class" ]; then
+          # An older control plane sends no class. This mapping IS the previous
+          # behaviour, so a project built before this action builds identically
+          # after it.
+          case "$PROJECT_TYPE" in
+            opennext) class=hybrid ;;
+            *)        class=static ;;
+          esac
+        fi
+
+        case "$class" in
+          static|hybrid) ;;
+          dynamic)
+            # A server with nothing servable — Express, NestJS, FastAPI, Flask,
+            # Django, Go. The packaging steps assume a build output tree that a
+            # dynamic framework does not produce, and four of those six need a
+            # toolchain this runner does not install.
+            #
+            # Refused HERE, loudly, rather than allowed to proceed. Building a
+            # static site from a server-rendered app is the worse failure: it
+            # succeeds, deploys, and then 404s every route at request time,
+            # which reads as the customer's bug.
+            echo "::error::${FRAMEWORK:-This framework} is a server-only app, which this build pipeline does not support yet."
+            echo "::error::Supported today: static sites, and hybrid (server-rendered) JavaScript frameworks."
+            exit 1 ;;
+          *)
+            echo "::error::unknown framework class '$class' — this runner understands static and hybrid"
+            exit 1 ;;
+        esac
+
+        # Passed through from the catalogue rather than assumed. Hugo declares
+        # `go` and Jekyll declares `ruby`; a runner that installs Node for them
+        # and then runs `hugo --minify` fails with "command not found", which
+        # names nothing useful. setup-toolchain refuses an unsupported one BY
+        # NAME instead.
+        #
+        # Empty means an older control plane that does not send it, and node is
+        # the right assumption there — it is what every project built with
+        # before this field existed.
+        toolchain="${TOOLCHAIN:-node}"
+
+        echo "class=$class" >> "$GITHUB_OUTPUT"
+        echo "toolchain=$toolchain" >> "$GITHUB_OUTPUT"
+        echo "Building ${FRAMEWORK:-$PROJECT_TYPE} as a $class app on $toolchain"

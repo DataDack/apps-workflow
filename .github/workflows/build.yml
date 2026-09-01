@@ -45,21 +45,37 @@ jobs:
             "$DATADACK_API/managedapps/actions/builds/claim" \
             -H "Authorization: Bearer $OIDC" -H "Content-Type: application/json" \
             --data-binary @claim-request.json -o claim.json
-          for key in build_id upload_url image_upload_url workload_upload_url runtime_target log_url root_dir install_command build_command output_dir node_version project_type; do
+          for key in build_id upload_url image_upload_url workload_upload_url runtime_target log_url root_dir install_command build_command output_dir node_version project_type framework framework_class toolchain toolchain_version; do
             value=$(jq -r --arg key "$key" '.data[$key] // empty' claim.json)
             printf '%s=%s\n' "$key" "$value" >> "$GITHUB_OUTPUT"
           done
           jq -r '.data.env // {} | to_entries[] | "::add-mask::" + .value' claim.json
           jq -r '.data.env // {} | to_entries[] | .key + "=" + .value' claim.json >> "$GITHUB_ENV"
 
-      - name: Set up Node
-        uses: actions/setup-node@v4
+      # Actions are referenced by their FULL path, not `./.github/actions/…`.
+      # This is a reusable workflow: the workspace holds the CUSTOMER's
+      # repository, so a relative path would resolve against their tree, where
+      # these do not exist.
+      #
+      # `@main` is deliberate here and is not the floating-version mistake it
+      # resembles. The customer's caller pins `build.yml@main` already — that is
+      # the stable contract — and everything inside it is meant to move without
+      # a pull request into their repository. What must never float is a
+      # THIRD-PARTY input we do not control; these are ours.
+      - name: Resolve build shape
+        id: shape
+        uses: DataDack/workflows/.github/actions/resolve-shape@main
         with:
-          node-version: ${{ steps.claim.outputs.node_version }}
+          framework_class: ${{ steps.claim.outputs.framework_class }}
+          project_type: ${{ steps.claim.outputs.project_type }}
+          framework: ${{ steps.claim.outputs.framework }}
+          toolchain: ${{ steps.claim.outputs.toolchain }}
 
-      - name: Set up Bun
-        shell: bash
-        run: npm install --global bun@1
+      - name: Set up toolchain
+        uses: DataDack/workflows/.github/actions/setup-toolchain@main
+        with:
+          toolchain: ${{ steps.shape.outputs.toolchain }}
+          node_version: ${{ steps.claim.outputs.node_version }}
 
       - name: Start build log
         shell: bash
@@ -106,7 +122,7 @@ jobs:
       # fails every request: a node-wrapped bundle exports no handler for the
       # worker to call, and a lambda-wrapped one never listens on a port.
       - name: Configure OpenNext
-        if: steps.claim.outputs.project_type == 'opennext'
+        if: steps.shape.outputs.class == 'hybrid'
         shell: bash
         working-directory: ${{ steps.claim.outputs.root_dir }}
         env:
@@ -151,7 +167,7 @@ jobs:
         run: set -o pipefail; bash -o pipefail -c "$DATADACK_COMMAND" 2>&1 | tee -a "$RUNNER_TEMP/datadack.log"
 
       - name: Verify OpenNext produced a server
-        if: steps.claim.outputs.project_type == 'opennext'
+        if: steps.shape.outputs.class == 'hybrid'
         shell: bash
         working-directory: ${{ steps.claim.outputs.root_dir }}
         env:
@@ -182,7 +198,7 @@ jobs:
         env:
           ROOT_DIR: ${{ steps.claim.outputs.root_dir }}
           OUTPUT_DIR: ${{ steps.claim.outputs.output_dir }}
-          PROJECT_TYPE: ${{ steps.claim.outputs.project_type }}
+          BUILD_CLASS: ${{ steps.shape.outputs.class }}
           NODE_VERSION: ${{ steps.claim.outputs.node_version }}
         run: |
           set -euo pipefail
@@ -190,7 +206,7 @@ jobs:
           (cd "$output" && zip -qr "$RUNNER_TEMP/dist.zip" .)
           mkdir -p "$RUNNER_TEMP/imgctx/app"
           cp -a "$output/." "$RUNNER_TEMP/imgctx/app/"
-          if [ "$PROJECT_TYPE" = opennext ]; then
+          if [ "$BUILD_CLASS" = hybrid ]; then
             cat > "$RUNNER_TEMP/imgctx/Dockerfile" <<EOF
           FROM node:${NODE_VERSION}-alpine
           WORKDIR /app
@@ -241,7 +257,7 @@ jobs:
         env:
           ROOT_DIR: ${{ steps.claim.outputs.root_dir }}
           OUTPUT_DIR: ${{ steps.claim.outputs.output_dir }}
-          PROJECT_TYPE: ${{ steps.claim.outputs.project_type }}
+          BUILD_CLASS: ${{ steps.shape.outputs.class }}
           UPLOAD_URL: ${{ steps.claim.outputs.workload_upload_url }}
         run: |
           set -euo pipefail
@@ -255,14 +271,14 @@ jobs:
 
           # Two shapes of bundle, decided by whether the build produced a server.
           #
-          # opennext: OpenNext's server bundle at the archive root, plus the
+          # hybrid: the server bundle at the archive root, plus the
           # assets it does not serve. The wrapper delegates page requests to it.
           #
-          # react: no server at all — the build output IS the site. The same
+          # static: no server at all — the build output IS the site. The same
           # wrapper serves it with try-files behaviour, which is what the Caddy
           # container did. Nothing else about the packaging differs, which is
           # why one wrapper covers both.
-          if [ "$PROJECT_TYPE" = opennext ]; then
+          if [ "$BUILD_CLASS" = hybrid ]; then
             bundle="$out/server-functions/default"
             [ -d "$bundle" ] || { echo "::error::$bundle is missing — OpenNext produced no server function"; exit 1; }
             [ -f "$bundle/index.mjs" ] || {
