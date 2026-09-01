@@ -11,6 +11,12 @@ inputs:
   node_version:
     description: The major the project builds against.
     required: true
+  install_command:
+    description: >
+      The command the build will install with. Optional, and used only to check
+      that the tool it names is actually on this runner — see the last step.
+    required: false
+    default: ""
   bun_version:
     description: >
       Pinned exactly, never a floating major. A build input that can move on its
@@ -44,11 +50,71 @@ runs:
       with:
         node-version: ${{ inputs.node_version }}
 
+    # pnpm and Yarn, from Corepack — which ships with Node, so this costs a
+    # pair of shims and no download: the manager itself is fetched on first use
+    # and only for the one a build actually calls.
+    #
+    # They were missing entirely. The platform picks an install command from
+    # whichever lockfile a repository has, so a pnpm-lock.yaml produces
+    # `pnpm install --frozen-lockfile`, and this action set up Node and Bun and
+    # nothing else — `npm ci` worked only because npm arrives with Node. Every
+    # pnpm and Yarn repository died on the first line of its install step. The
+    # cache paths below have been reserving ~/.cache/yarn and the pnpm store the
+    # whole time, for managers that were never installed.
+    - name: Set up pnpm and Yarn
+      shell: bash
+      env:
+        # Corepack otherwise stops on an interactive "download this?" prompt,
+        # which on a runner is silence until the job times out.
+        COREPACK_ENABLE_DOWNLOAD_PROMPT: "0"
+      run: |
+        set -euo pipefail
+        if corepack enable pnpm yarn 2>/dev/null; then
+          echo "pnpm and Yarn are available through Corepack"
+        else
+          # Corepack is bundled with Node today but has been slated for
+          # unbundling, and a runner image can also ship a Yarn that already
+          # owns the name. Neither is worth failing a build that may use
+          # neither manager, so fall back rather than exit.
+          echo "::warning::Corepack is unavailable; installing pnpm and Yarn globally instead"
+          npm install --global pnpm yarn
+        fi
+
     - name: Set up Bun
       shell: bash
       env:
         BUN_VERSION: ${{ inputs.bun_version }}
       run: npm install --global "bun@${BUN_VERSION}"
+
+    # The install command names a binary, and this is where a missing one is
+    # cheap to find. It is the same argument the toolchain check at the top of
+    # this action makes, one level down: failing HERE says which tool is absent,
+    # while letting the install step discover it produces
+    # "bash: line 1: pnpm: command not found" — which reads as a broken
+    # repository rather than as a runner that was never given pnpm.
+    #
+    # Deliberately a check and not a provisioning step. Anything this runner is
+    # meant to support is installed above; reaching this and failing means the
+    # platform sent a command for a manager nobody taught this action about, and
+    # guessing at an install for it is how the wrong one ends up resolving a
+    # lockfile it does not understand.
+    - name: Verify the install command can run
+      if: inputs.install_command != ''
+      shell: bash
+      env:
+        DATADACK_COMMAND: ${{ inputs.install_command }}
+      run: |
+        set -euo pipefail
+        bin=$(printf '%s\n' "$DATADACK_COMMAND" | awk '{print $1}')
+        if [ -z "$bin" ]; then
+          echo "::error::the platform sent an empty install command"
+          exit 1
+        fi
+        if ! command -v "$bin" >/dev/null 2>&1; then
+          echo "::error::the install command runs '$bin', which is not on this runner — available: npm, pnpm, yarn, bun"
+          exit 1
+        fi
+        echo "install command runs $bin ($(command -v "$bin"))"
 
     # Every build re-downloaded its whole dependency tree before this:
     # setup-node was used without its `cache:` input, so nothing survived

@@ -76,6 +76,11 @@ jobs:
         with:
           toolchain: ${{ steps.shape.outputs.toolchain }}
           node_version: ${{ steps.claim.outputs.node_version }}
+          # Passed so the action can check the install command's binary exists
+          # while it is still a toolchain problem. It provisions from it, never
+          # runs it — the install itself stays in its own step below, where its
+          # output is streamed to the customer's build log.
+          install_command: ${{ steps.claim.outputs.install_command }}
 
       - name: Start build log
         shell: bash
