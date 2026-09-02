@@ -45,7 +45,7 @@ jobs:
             "$DATADACK_API/managedapps/actions/builds/claim" \
             -H "Authorization: Bearer $OIDC" -H "Content-Type: application/json" \
             --data-binary @claim-request.json -o claim.json
-          for key in build_id upload_url image_upload_url workload_upload_url runtime_target log_url root_dir install_command build_command output_dir node_version project_type framework framework_class toolchain toolchain_version; do
+          for key in build_id upload_url image_upload_url workload_upload_url runtime_target log_url runtime_url runtime_sha256 root_dir install_command build_command output_dir node_version project_type framework framework_class toolchain toolchain_version; do
             value=$(jq -r --arg key "$key" '.data[$key] // empty' claim.json)
             printf '%s=%s\n' "$key" "$value" >> "$GITHUB_OUTPUT"
           done
@@ -242,18 +242,49 @@ jobs:
       # bucket, not this platform's: a worker fetches packages only from that
       # one, so a bundle uploaded anywhere else deploys a workload whose code
       # cannot be read.
-      # The platform's own runtime files, checked out beside the customer's app.
-      # The asset wrapper lives here as a real, reviewable .mjs file rather than
-      # a heredoc in this workflow, because it is a hundred lines of security
-      # relevant path handling and that does not belong inside YAML.
-      - name: Check out platform runtime
+      # The platform's asset wrapper, fetched from the build API.
+      #
+      # It used to be checked out from this repository, which is PUBLIC — it has
+      # to be, because a reusable workflow called from a customer's own
+      # repository must be readable by it. That published the whole wrapper:
+      # three hundred lines of asset path resolution, the traversal guard, the
+      # SPA fallback rules and the marker file the static/server mode decision
+      # turns on. It is served over the build's own OIDC token now, so it reaches
+      # the machine building an app and nothing else.
+      #
+      # Two things improve as a side effect. The wrapper is versioned WITH the
+      # control plane that invokes it rather than floating on @main here, so a
+      # wrapper and a fleet can no longer be a release apart. And the digest is
+      # checked below, so a truncated or tampered transfer fails the build rather
+      # than shipping a bundle that 500s on every request.
+      - name: Fetch platform runtime
         if: steps.claim.outputs.runtime_target == 'serverless'
-        uses: actions/checkout@v4
-        with:
-          repository: DataDack/workflows
-          ref: main
-          path: .datadack-runtime
-          persist-credentials: false
+        shell: bash
+        env:
+          RUNTIME_URL: ${{ steps.claim.outputs.runtime_url }}
+          RUNTIME_SHA256: ${{ steps.claim.outputs.runtime_sha256 }}
+          OIDC: ${{ steps.claim.outputs.oidc }}
+        run: |
+          set -euo pipefail
+          if [ -z "$RUNTIME_URL" ]; then
+            echo "::error::this project targets the serverless runtime but the platform issued no runtime URL"
+            exit 1
+          fi
+          mkdir -p "$RUNNER_TEMP/datadack-runtime"
+          curl -sS --fail-with-body --retry 3 --retry-all-errors \
+            -H "Authorization: Bearer $OIDC" \
+            "$RUNTIME_URL" -o "$RUNNER_TEMP/datadack-runtime/datadack-handler.mjs"
+
+          # Verified, not trusted. A handler that arrived truncated still
+          # imports, still exports `handler`, and still fails at REQUEST time —
+          # as a blank page, long after the build was reported green.
+          if [ -n "$RUNTIME_SHA256" ]; then
+            actual=$(sha256sum "$RUNNER_TEMP/datadack-runtime/datadack-handler.mjs" | cut -d" " -f1)
+            if [ "$actual" != "$RUNTIME_SHA256" ]; then
+              echo "::error::the platform runtime failed its checksum (expected $RUNTIME_SHA256, got $actual)"
+              exit 1
+            fi
+          fi
 
       - name: Package and upload serverless bundle
         if: steps.claim.outputs.runtime_target == 'serverless'
@@ -315,7 +346,7 @@ jobs:
               echo "::error::the build output contains index.mjs at its root, which collides with the server-bundle marker"; exit 1; }
           fi
 
-          cp "$GITHUB_WORKSPACE/.datadack-runtime/runtime/datadack-handler.mjs" "$staging/datadack-handler.mjs"
+          cp "$RUNNER_TEMP/datadack-runtime/datadack-handler.mjs" "$staging/datadack-handler.mjs"
 
           # 250 MB unpacked is the platform ceiling. Failing here names the real
           # problem; letting it through fails the deploy with a size error the
