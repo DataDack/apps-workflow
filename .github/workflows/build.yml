@@ -7,6 +7,19 @@ on:
         description: DataDack project identifier
         required: true
         type: string
+      build_type:
+        # Which KIND of build this is. The platform's build runner carries typed
+        # builds; a managed application is one kind, and today the only one.
+        #
+        # NOT required, and the default is what makes it safe to add. Every
+        # repository already on an older caller sends nothing, and the server
+        # reads an absent type as the default kind — which is this one. A
+        # required input would have failed every one of those callers on their
+        # next push, all at once, because this workflow runs at @main.
+        description: Kind of build to claim (managed_apps)
+        required: false
+        default: managed_apps
+        type: string
 
 permissions:
   contents: read
@@ -17,8 +30,23 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     env:
-      DATADACK_API: https://console.datadack.cloud/api/v1
+      # The build runner's own origin. It used to be the console
+      # (console.datadack.cloud/api/v1), which proxied these four routes through
+      # to the build service — a hop that existed only because this file runs at
+      # @main for every repository on the platform, so the URL in it could not be
+      # changed for one project or rolled back for one project.
+      #
+      # It is changed for all of them here, which is the only way it can be
+      # changed. The console's proxy stays mounted so a run that claimed through
+      # it can still report; nothing new goes near it.
+      #
+      # The two callback URLs a build actually uses at length — the log stream
+      # and the runtime wrapper — are NOT here. They come back on the claim
+      # response, so the server decides where a runner reports and this file
+      # never has to be edited to move them again.
+      DATADACK_API: https://serverless.datadack.cloud
       DATADACK_PROJECT_ID: ${{ inputs.project_id }}
+      DATADACK_BUILD_TYPE: ${{ inputs.build_type }}
     steps:
       - name: Check out application
         uses: actions/checkout@v4
@@ -35,17 +63,18 @@ jobs:
           echo "oidc=$OIDC" >> "$GITHUB_OUTPUT"
           jq -n \
             --arg project_id "$DATADACK_PROJECT_ID" \
+            --arg build_type "$DATADACK_BUILD_TYPE" \
             --arg run_id "$GITHUB_RUN_ID" \
             --arg run_attempt "$GITHUB_RUN_ATTEMPT" \
             --arg sha "$GITHUB_SHA" \
             --arg ref "$GITHUB_REF" \
             --arg run_url "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
-            '{project_id:$project_id,run_id:$run_id,run_attempt:$run_attempt,sha:$sha,ref:$ref,run_url:$run_url}' > claim-request.json
+            '{project_id:$project_id,build_type:$build_type,run_id:$run_id,run_attempt:$run_attempt,sha:$sha,ref:$ref,run_url:$run_url}' > claim-request.json
           curl -sS --fail-with-body -X POST \
-            "$DATADACK_API/managedapps/actions/builds/claim" \
+            "$DATADACK_API/v1/build-runner/claim" \
             -H "Authorization: Bearer $OIDC" -H "Content-Type: application/json" \
             --data-binary @claim-request.json -o claim.json
-          for key in build_id upload_url image_upload_url workload_upload_url runtime_target log_url runtime_url runtime_sha256 root_dir install_command build_command output_dir node_version project_type framework framework_class toolchain toolchain_version; do
+          for key in build_id build_type upload_url image_upload_url workload_upload_url runtime_target log_url runtime_url runtime_sha256 root_dir install_command build_command output_dir node_version project_type framework framework_class toolchain toolchain_version; do
             value=$(jq -r --arg key "$key" '.data[$key] // empty' claim.json)
             printf '%s=%s\n' "$key" "$value" >> "$GITHUB_OUTPUT"
           done
@@ -481,5 +510,5 @@ jobs:
             --argjson bytes "$bytes" --argjson image_bytes "$image_bytes" --argjson workload_bytes "$workload_bytes" \
             '{status:$status,sha256:$sha256,bytes:$bytes,image_sha256:$image_sha256,image_bytes:$image_bytes,workload_sha256:$workload_sha256,workload_bytes:$workload_bytes,job_status:$job_status}' > complete.json
           curl -sS --fail-with-body --retry 6 --retry-all-errors --retry-delay 5 --max-time 30 -X POST \
-            "$DATADACK_API/managedapps/actions/builds/${{ steps.claim.outputs.build_id }}/complete" \
+            "$DATADACK_API/v1/build-runner/builds/${{ steps.claim.outputs.build_id }}/complete" \
             -H "Authorization: Bearer ${{ steps.claim.outputs.oidc }}" -H "Content-Type: application/json" --data-binary @complete.json
